@@ -1,0 +1,5 @@
+name: astrbot_plugin_shrink_desktop
+display_name: 石英电脑控制
+desc: 配对 Windows 设备，直接控制本机 Agent 与会话
+version: v0.1.0
+author: Shrink
