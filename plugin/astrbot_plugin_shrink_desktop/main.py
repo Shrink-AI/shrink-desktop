@@ -17,7 +17,10 @@ from .plugin_protocol import CapabilityClient, success, validate
 
 
 ACTIONS = {
-    "devices": "查看设备及在线状态",
+    "devices": "查看自己拥有或获授权的设备；空列表表示无可见设备，不能判断他人设备离线",
+    "grant": "设备所有者授权另一位已配置管理员访问及控制设备和会话；须得到所有者明确指令",
+    "grants": "设备所有者查看授权名单",
+    "ungrant": "设备所有者撤销另一管理员的设备访问授权",
     "pair": "创建五分钟有效的一次性设备配对码",
     "revoke": "撤销指定设备",
     "sessions": "查看设备托管会话",
@@ -63,7 +66,7 @@ class ShrinkDesktop(Star):
 
     def plugin_capabilities(self):
         parameters = {"type": "object", "properties": {
-            "device_id": {"type": "string"}, "request_id": {"type": "string"},
+            "grantee": {"type": "string"}, "device_id": {"type": "string"}, "request_id": {"type": "string"},
             "agent": {"type": "string", "enum": ["codex", "claude", "dsh"]},
             "cwd": {"type": "string"}, "prompt": {"type": "string"},
             "session_id": {"type": "string"}, "query": {"type": "string"},
@@ -76,7 +79,7 @@ class ShrinkDesktop(Star):
         }}
         return {"protocol": 1, "capabilities": [
             {"name": "computer.control", "version": 1, "description": "直接控制配对电脑上的 Agent，无中间模型",
-             "actions": {name: {"description": desc, "readonly": name in {"devices", "sessions", "discover", "read", "windows", "capture", "inspect_window", "timeline", "result", "watches"},
+             "actions": {name: {"description": desc, "readonly": name in {"devices", "grants", "sessions", "discover", "read", "windows", "capture", "inspect_window", "timeline", "result", "watches"},
                                 "parameters": parameters} for name, desc in ACTIONS.items()}},
             {"name": "computer.tasks", "version": 1, "description": "电脑任务提交和查询",
              "actions": {
@@ -115,6 +118,14 @@ class ShrinkDesktop(Star):
         owner = t.scope(scope)
         if action == "devices":
             return t.devices(scope)
+        if action in {"grant", "grants", "ungrant"}:
+            device = args.get("device_id", "")
+            if action == "grants":
+                return t.grants(device, scope)
+            grantee = str(args.get("grantee", ""))
+            if action == "grant" and grantee not in {str(x) for x in self.context.get_config().get("admins_id", [])}:
+                raise ValueError("被授权人必须已配置为 AstrBot 管理员")
+            return t.grant(device, grantee, scope, remove=action == "ungrant")
         if action == "pair":
             return t.pairing(scope)
         if action == "result":
@@ -159,8 +170,8 @@ class ShrinkDesktop(Star):
         """直接管理配对电脑的 Codex、Claude、DSH 及已有窗口。
 
         Args:
-            action(string): devices/pair/sessions/discover/start/resume/read/send/interrupt/approve/windows/bind_window/inspect_window/capture/input/window_action/watch/unwatch/timeline/result/revoke
-            arguments(string): JSON 对象；设备操作带 device_id；start 带 agent、cwd、prompt、request_id；会话操作带 session_id；写操作必须使用稳定且每个操作不同的 request_id。
+            action(string): devices/grant/grants/ungrant/pair/sessions/discover/start/resume/read/send/interrupt/approve/windows/bind_window/inspect_window/capture/input/window_action/watch/unwatch/timeline/result/revoke
+            arguments(string): JSON 对象；grant/ungrant带device_id和grantee（另一管理员账号）；授权只由设备所有者明确要求，不能自行推定。设备列表为空只说明不可见，不表示离线，也不否定历史测试结果。设备操作带 device_id；start 带 agent、cwd、prompt、request_id；会话操作带 session_id；写操作必须使用稳定且每个操作不同的 request_id。
         """
         if not event.is_admin():
             return json.dumps({"ok": False, "error": "仅管理员可控制电脑"}, ensure_ascii=False)

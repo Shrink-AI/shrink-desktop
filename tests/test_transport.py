@@ -157,3 +157,33 @@ async def test_device_cannot_complete_another_device_command_or_rebind_replayed_
     finally:
         await client.close()
         await t.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_grant_access_and_owner_only_revocation(tmp_path):
+    t = Transport(tmp_path)
+    other = {**SCOPE, "sender": "other", "session": "private:other"}
+    with t.db:
+        t.db.execute("INSERT INTO devices(id,name,hash,owner) VALUES('d','test','hash','owner')")
+        t.db.execute("INSERT INTO sessions VALUES('d','s',?)", (t.scope(SCOPE),))
+    assert t.devices(other) == []
+    t.grant("d", "other", SCOPE)
+    assert t.devices(other)[0]["access"] == "delegated"
+    assert t.session_access("d", t.scope(SCOPE), other)
+    for action in [lambda: t.grant("d", "third", other), lambda: t.grants("d", other)]:
+        with pytest.raises(PermissionError): action()
+    with pytest.raises(PermissionError): await t.revoke("d", other)
+    with pytest.raises(PermissionError): t.device("d", {**other, "admin": False})
+    pending = await t.command("d", "read", {"session_id": "s"}, other, "read", timeout=0.001)
+    assert pending["state"] == "pending"
+    assert t.rows("SELECT scope FROM sessions")[0]["scope"] == t.scope(SCOPE)
+    t.grant("d", "other", SCOPE, remove=True)
+    assert t.devices(other) == []
+    assert t.result(pending["command_id"], other)["result"]["ok"] is False
+    with pytest.raises(PermissionError):
+        await t.command("d", "read", {"session_id": "s"}, other, "again", timeout=0.001)
+    await t.close()
+    reopened = Transport(tmp_path)
+    assert reopened.devices(other) == []
+    assert len(reopened.rows("SELECT * FROM grant_audit")) == 2
+    await reopened.close()

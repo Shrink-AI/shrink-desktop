@@ -49,3 +49,10 @@ dotnet publish src/Shrink.Desktop -c Release -r win-x64 --self-contained true -o
 ## 许可
 
 AGPL-3.0，见 [LICENSE](LICENSE)。
+
+
+### 管理员间设备授权
+
+设备所有者可用 `shrink_computer` 的 `grant`、`grants`、`ungrant` 操作授予、查看和撤销授权。`grant/ungrant` 参数为 `device_id`、`grantee`（已配置的另一管理员账号）。授权允许该管理员查看和控制指定设备及其已有 Agent 会话；不允许继续转授权或撤销设备。原任务和监工仍回传各自原会话，不随授权迁移。撤销后取消尚未完成的排队命令和监工；已经送到电脑执行的操作不会自动倒退。授权及撤销保留审计，重启后仍有效。
+
+设备列表为空只表示当前管理员没有可见设备，不表示其他人的电脑离线，不能据此否定已确认的安装或测试结果。

@@ -24,6 +24,8 @@ class Transport:
         PRAGMA journal_mode=WAL;
         CREATE TABLE IF NOT EXISTS pairs(hash TEXT PRIMARY KEY,owner TEXT,expires REAL);
         CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY,name TEXT,hash TEXT,owner TEXT,revoked INTEGER DEFAULT 0,last_seen REAL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS device_grants(device TEXT,grantee TEXT,created REAL,PRIMARY KEY(device,grantee));
+        CREATE TABLE IF NOT EXISTS grant_audit(device TEXT,owner TEXT,grantee TEXT,action TEXT,created REAL);
         CREATE TABLE IF NOT EXISTS commands(id TEXT PRIMARY KEY,device TEXT,scope TEXT,request TEXT,result TEXT,created REAL);
         CREATE TABLE IF NOT EXISTS events(device TEXT,seq INTEGER,body TEXT,PRIMARY KEY(device,seq));
         CREATE TABLE IF NOT EXISTS sessions(device TEXT,id TEXT,scope TEXT,PRIMARY KEY(device,id));
@@ -89,21 +91,60 @@ class Transport:
                             (device, str(body.get("name", "Windows"))[:120], digest(token), row["owner"]))
         return web.json_response({"device_id": device, "token": token})
 
-    def device(self, device, scope):
+    def device(self, device, scope, owner_only=False):
         self.scope(scope)
-        row = self.db.execute("SELECT * FROM devices WHERE id=? AND owner=? AND revoked=0",
-                              (device, str(scope["sender"]))).fetchone()
+        row = self.db.execute("SELECT * FROM devices WHERE id=? AND revoked=0", (device,)).fetchone()
         if not row:
-            raise PermissionError("Device unavailable or owned by another administrator")
+            raise PermissionError("设备不存在或已撤销；不能据此判断电脑离线")
+        sender = str(scope["sender"])
+        granted = self.db.execute("SELECT 1 FROM device_grants WHERE device=? AND grantee=?",
+                                  (device, sender)).fetchone()
+        if row["owner"] != sender and (owner_only or not granted):
+            raise PermissionError("当前管理员没有这台设备的访问授权；这不表示设备离线")
         return row
 
     def devices(self, scope):
         self.scope(scope)
-        return [{**r, "online": r["id"] in self.sockets and time.time() - r["last_seen"] < 20}
-                for r in self.rows("SELECT id,name,last_seen,revoked FROM devices WHERE owner=?", (str(scope["sender"]),))]
+        sender = str(scope["sender"])
+        return [{**{k: v for k, v in r.items() if k != "owner"}, "access": "owner" if r["owner"] == sender else "delegated",
+                 "online": r["id"] in self.sockets and time.time() - r["last_seen"] < 20}
+                for r in self.rows("SELECT id,name,last_seen,revoked,owner FROM devices WHERE owner=? "
+                    "OR (revoked=0 AND id IN (SELECT device FROM device_grants WHERE grantee=?))", (sender, sender))]
+
+    def grants(self, device, scope):
+        self.device(device, scope, owner_only=True)
+        return self.rows("SELECT grantee,created FROM device_grants WHERE device=?", (device,))
+
+    def grant(self, device, grantee, scope, remove=False):
+        row = self.device(device, scope, owner_only=True)
+        grantee = str(grantee).strip()
+        if not grantee or len(grantee) > 128 or grantee == row["owner"]:
+            raise ValueError("请选择其他管理员")
+        with self.db:
+            if remove:
+                self.db.execute("DELETE FROM device_grants WHERE device=? AND grantee=?", (device, grantee))
+                # Queued commands cannot become executable after authorization is withdrawn.
+                self.db.execute("UPDATE commands SET result=? WHERE device=? AND result IS NULL "
+                    "AND json_extract(scope,'$.sender')=?", (json.dumps({
+                        "ok": False, "state": "unknown",
+                        "error": "设备授权已撤销，停止重发；已发出操作的执行结果尚未确认"
+                    }), device, grantee))
+                self.db.execute("UPDATE watches SET active=0 WHERE device=? AND json_extract(scope,'$.sender')=?", (device, grantee))
+            else:
+                self.db.execute("INSERT OR REPLACE INTO device_grants VALUES(?,?,?)", (device, grantee, time.time()))
+            self.db.execute("INSERT INTO grant_audit VALUES(?,?,?,?,?)",
+                (device, str(scope["sender"]), grantee, "revoke" if remove else "grant", time.time()))
+        return {"ok": True, "device_id": device, "grantee": grantee, "granted": not remove}
+
+    def session_access(self, device, stored_scope, scope):
+        self.device(device, scope)
+        if stored_scope == self.scope(scope):
+            return True
+        return bool(self.db.execute("SELECT 1 FROM device_grants WHERE device=? AND grantee=?",
+                                   (device, str(scope["sender"]))).fetchone())
 
     async def revoke(self, device, scope):
-        self.device(device, scope)
+        self.device(device, scope, owner_only=True)
         with self.db:
             self.db.execute("UPDATE devices SET revoked=1 WHERE id=?", (device,))
         if ws := self.sockets.get(device):
@@ -185,11 +226,11 @@ class Transport:
         sid = arguments.get("session_id", "")
         if action in {"capture", "inspect_window", "input", "window_action"}:
             binding = self.db.execute("SELECT scope FROM bindings WHERE device=? AND id=?", (device, arguments.get("binding", ""))).fetchone()
-            if not binding or binding["scope"] != owner:
+            if not binding or not self.session_access(device, binding["scope"], scope):
                 raise PermissionError("Window binding belongs to another conversation")
         if sid and not sid.startswith("external:"):
             session = self.db.execute("SELECT scope FROM sessions WHERE device=? AND id=?", (device, sid)).fetchone()
-            if not session or session["scope"] != owner:
+            if not session or not self.session_access(device, session["scope"], scope):
                 raise PermissionError("Session belongs to another conversation")
         command_id = digest(owner + "|" + device + "|" + request_id)
         request = {"type": "command", "id": command_id, "action": action, "arguments": arguments}
@@ -223,7 +264,7 @@ class Transport:
     def timeline(self, device, session, scope):
         self.device(device, scope)
         owned = self.db.execute("SELECT scope FROM sessions WHERE device=? AND id=?", (device, session)).fetchone()
-        if not owned or owned["scope"] != self.scope(scope):
+        if not owned or not self.session_access(device, owned["scope"], scope):
             raise PermissionError("Session belongs to another conversation")
         events = self.rows("SELECT seq,body FROM events WHERE device=? AND json_extract(body,'$.session_id')=? ORDER BY seq DESC LIMIT 100", (device, session))
         deliveries = {r["seq"]: r["state"] for r in self.rows("SELECT seq,state FROM deliveries WHERE device=? AND scope=?", (device, self.scope(scope)))}
